@@ -18,6 +18,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -88,6 +89,23 @@ type Client struct {
 	Tokens  TokenSource
 	HTTP    *http.Client
 	Timeout time.Duration // defaults to DefaultTimeout
+
+	// RateLimitPerMinute is the request budget the pacer enforces
+	// (0 means DefaultRateLimitPerMinute, Schwab's published 120/min).
+	RateLimitPerMinute int
+	// Pacer, when set, replaces the pacer built from RateLimitPerMinute.
+	// It is the injection point tests use to observe or speed up pacing.
+	Pacer Pacer
+	// MaxRetries is how many times a 429 response is retried
+	// (0 means DefaultMaxRetries; a negative value disables retries).
+	MaxRetries int
+	// RetryBaseDelay is the first backoff delay after a 429 without a
+	// Retry-After header (0 means DefaultRetryBaseDelay).
+	RetryBaseDelay time.Duration
+
+	pacerMu    sync.Mutex
+	builtPacer Pacer
+	pacerErr   error
 }
 
 // New builds a Client. tokens may be nil only in tests that also stub HTTP
@@ -114,21 +132,102 @@ func (c *Client) httpClient() *http.Client {
 	return &http.Client{Timeout: timeout}
 }
 
+// pacer returns the request pacer every call must pass through: the
+// injected Pacer if one was set, otherwise a smooth (burst 1) token bucket
+// built from RateLimitPerMinute, created lazily on first use.
+func (c *Client) pacer() (Pacer, error) {
+	if c.Pacer != nil {
+		return c.Pacer, nil
+	}
+	c.pacerMu.Lock()
+	defer c.pacerMu.Unlock()
+	if c.builtPacer == nil && c.pacerErr == nil {
+		rpm := c.RateLimitPerMinute
+		if rpm == 0 {
+			rpm = DefaultRateLimitPerMinute
+		}
+		c.builtPacer, c.pacerErr = NewRateLimiter(rpm)
+	}
+	return c.builtPacer, c.pacerErr
+}
+
+func (c *Client) maxRetries() int {
+	if c.MaxRetries < 0 {
+		return 0
+	}
+	if c.MaxRetries == 0 {
+		return DefaultMaxRetries
+	}
+	return c.MaxRetries
+}
+
+func (c *Client) retryBaseDelay() time.Duration {
+	if c.RetryBaseDelay <= 0 {
+		return DefaultRetryBaseDelay
+	}
+	return c.RetryBaseDelay
+}
+
 // do performs one authenticated request, mirroring the _get_request /
-// _post_request / _put_request / _delete_request helpers in schwab-py.
+// _post_request / _put_request / _delete_request helpers in schwab-py,
+// with two additions schwab-py leaves to the caller: every attempt is
+// paced through the rate limiter, and HTTP 429 responses are retried
+// (honoring Retry-After, else exponential backoff) up to MaxRetries times.
 func (c *Client) do(ctx context.Context, method, path string,
 	params url.Values, jsonBody any) (*Response, error) {
 	u := c.baseURL() + path
 	if len(params) > 0 {
 		u += "?" + params.Encode()
 	}
-	var body io.Reader
+	var bodyBytes []byte
 	if jsonBody != nil {
 		data, err := json.Marshal(jsonBody)
 		if err != nil {
 			return nil, err
 		}
-		body = bytes.NewReader(data)
+		bodyBytes = data
+	}
+	maxRetries := c.maxRetries()
+	for attempt := 0; ; attempt++ {
+		pacer, err := c.pacer()
+		if err != nil {
+			return nil, err
+		}
+		if err := pacer.Wait(ctx); err != nil {
+			return nil, err
+		}
+		resp, err := c.doOnce(ctx, method, u, bodyBytes)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode != http.StatusTooManyRequests {
+			return resp, nil
+		}
+		if attempt >= maxRetries {
+			rpm := c.RateLimitPerMinute
+			if rpm <= 0 {
+				rpm = DefaultRateLimitPerMinute
+			}
+			return nil, fmt.Errorf("schwab API rate limit exceeded: "+
+				"HTTP 429 persisted through %d attempt(s) at a configured "+
+				"limit of %d requests/minute; wait before retrying, and "+
+				"only raise the rate limit if your app's tier allows more "+
+				"than Schwab's standard 120 requests/minute",
+				attempt+1, rpm)
+		}
+		delay := retryDelay(resp.Header, attempt, c.retryBaseDelay())
+		if err := sleepContext(ctx, delay); err != nil {
+			return nil, err
+		}
+	}
+}
+
+// doOnce issues a single HTTP attempt for do().
+func (c *Client) doOnce(ctx context.Context, method, u string,
+	bodyBytes []byte) (*Response, error) {
+	var body io.Reader
+	if bodyBytes != nil {
+		body = bytes.NewReader(bodyBytes)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, u, body)
 	if err != nil {
@@ -142,7 +241,7 @@ func (c *Client) do(ctx context.Context, method, path string,
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 	req.Header.Set("Accept", "application/json")
-	if jsonBody != nil {
+	if bodyBytes != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	resp, err := c.httpClient().Do(req)

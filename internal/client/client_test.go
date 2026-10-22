@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 type staticTokens struct{ tok string }
@@ -47,6 +49,10 @@ func newTestClient(t *testing.T, status int, body string,
 	t.Cleanup(srv.Close)
 	c := New("KEY_PLACEHOLDER", staticTokens{"TOKEN_PLACEHOLDER"})
 	c.BaseURL = srv.URL
+	// Request-construction tests are not pacing tests: use an unlimited
+	// pacer so they do not wait out the production 500ms interval.
+	// Pacing itself is covered in ratelimit_test.go.
+	c.Pacer = rate.NewLimiter(rate.Inf, 1)
 	return c, cap
 }
 
