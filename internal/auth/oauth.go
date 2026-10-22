@@ -27,6 +27,13 @@ type OAuthClient struct {
 	TokenURL    string // defaults to TokenEndpoint
 	HTTPClient  *http.Client
 	StateLength int
+
+	// WaitBeforeRequest, when set, runs before every token-endpoint
+	// request. The CLI uses it to pace token exchanges and refreshes
+	// through the same shared rate limiter as REST calls, so the
+	// 120-requests-per-minute budget covers them too. Nil means no
+	// pacing (the zero value used by library-style callers and tests).
+	WaitBeforeRequest func(ctx context.Context) error
 }
 
 func (c *OAuthClient) httpClient() *http.Client {
@@ -99,6 +106,11 @@ type tokenResponse struct {
 // authentication (app key as username, app secret as password), exactly as
 // authlib does for schwab-py.
 func (c *OAuthClient) postToken(ctx context.Context, form url.Values) (*Token, error) {
+	if c.WaitBeforeRequest != nil {
+		if err := c.WaitBeforeRequest(ctx); err != nil {
+			return nil, err
+		}
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.tokenURL(),
 		strings.NewReader(form.Encode()))
 	if err != nil {

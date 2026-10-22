@@ -55,7 +55,11 @@ https://127.0.0.1).`,
 		if err := requireCredentials(); err != nil {
 			return err
 		}
-		oauthClient := &auth.OAuthClient{APIKey: flagAPIKey, AppSecret: flagAppSecret}
+		oauthClient := &auth.OAuthClient{
+			APIKey:            flagAPIKey,
+			AppSecret:         flagAppSecret,
+			WaitBeforeRequest: paceRequest,
+		}
 
 		state, err := auth.NewState()
 		if err != nil {

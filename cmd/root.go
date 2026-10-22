@@ -8,9 +8,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/time/rate"
 
 	"github.com/rayli09/schwab-cli/internal/auth"
 	"github.com/rayli09/schwab-cli/internal/client"
@@ -22,6 +25,7 @@ var (
 	flagTokenPath string
 	flagTimeout   time.Duration
 	flagBaseURL   string
+	flagRateLimit int
 )
 
 // Execute runs the root command.
@@ -48,6 +52,68 @@ Order-mutating commands (place-order, replace-order, cancel-order) are
 dry-run by default: they print the request and send nothing. Pass --execute
 to actually send them.`,
 	SilenceUsage: true,
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		return validateRateLimitConfig()
+	},
+}
+
+// rateLimitDefault and rateLimitEnvErr resolve SCHWAB_RATE_LIMIT once at
+// startup: a valid positive value becomes the --rate-limit flag's default;
+// an invalid one is reported (via PersistentPreRunE) before any command
+// runs, so a typo'd environment fails fast instead of being ignored.
+var rateLimitDefault, rateLimitEnvErr = resolveRateLimitDefault()
+
+func resolveRateLimitDefault() (int, error) {
+	s := os.Getenv("SCHWAB_RATE_LIMIT")
+	if s == "" {
+		return client.DefaultRateLimitPerMinute, nil
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n <= 0 {
+		return client.DefaultRateLimitPerMinute, fmt.Errorf(
+			"invalid SCHWAB_RATE_LIMIT %q: must be a positive integer "+
+				"(requests per minute)", s)
+	}
+	return n, nil
+}
+
+// validateRateLimitConfig fails fast on an unusable rate-limit setting,
+// whether it came from the environment or the --rate-limit flag.
+func validateRateLimitConfig() error {
+	if rateLimitEnvErr != nil {
+		return rateLimitEnvErr
+	}
+	if flagRateLimit <= 0 {
+		return fmt.Errorf("invalid --rate-limit %d: must be a positive "+
+			"number of requests per minute (Schwab's Trader API limit "+
+			"is %d)", flagRateLimit, client.DefaultRateLimitPerMinute)
+	}
+	return nil
+}
+
+var (
+	sharedLimiter     *rate.Limiter
+	sharedLimiterErr  error
+	sharedLimiterOnce sync.Once
+)
+
+// sharedRateLimiter returns the one limiter shared by every REST client
+// and by the OAuth token calls, so a process-wide request budget is
+// enforced across all of them.
+func sharedRateLimiter() (*rate.Limiter, error) {
+	sharedLimiterOnce.Do(func() {
+		sharedLimiter, sharedLimiterErr = client.NewRateLimiter(flagRateLimit)
+	})
+	return sharedLimiter, sharedLimiterErr
+}
+
+// paceRequest is the WaitBeforeRequest hook for OAuth token calls.
+func paceRequest(ctx context.Context) error {
+	lim, err := sharedRateLimiter()
+	if err != nil {
+		return err
+	}
+	return lim.Wait(ctx)
 }
 
 func init() {
@@ -67,6 +133,10 @@ func init() {
 		client.DefaultTimeout, "HTTP timeout for API calls")
 	rootCmd.PersistentFlags().StringVar(&flagBaseURL, "base-url", "",
 		"override the API base URL (for testing)")
+	rootCmd.PersistentFlags().IntVar(&flagRateLimit, "rate-limit",
+		rateLimitDefault,
+		"max API requests per minute, paced smoothly (env: SCHWAB_RATE_LIMIT); "+
+			"Schwab's Trader API limit is 120")
 
 	rootCmd.AddCommand(authCmd)
 	rootCmd.AddCommand(streamCmd)
@@ -75,22 +145,28 @@ func init() {
 }
 
 // tokenManager builds the auth.Manager for the configured credentials.
+// Its OAuth calls are paced through the shared rate limiter.
 func tokenManager() *auth.Manager {
 	return &auth.Manager{
 		Path: flagTokenPath,
 		OAuth: &auth.OAuthClient{
-			APIKey:    flagAPIKey,
-			AppSecret: flagAppSecret,
+			APIKey:            flagAPIKey,
+			AppSecret:         flagAppSecret,
+			WaitBeforeRequest: paceRequest,
 		},
 	}
 }
 
-// newRESTClient builds an authenticated REST client from the global flags.
+// newRESTClient builds an authenticated REST client from the global flags,
+// pacing its requests through the limiter shared with the token calls.
 func newRESTClient() *client.Client {
 	c := client.New(flagAPIKey, tokenManager())
 	c.Timeout = flagTimeout
 	if flagBaseURL != "" {
 		c.BaseURL = flagBaseURL
+	}
+	if lim, err := sharedRateLimiter(); err == nil {
+		c.Pacer = lim
 	}
 	return c
 }
