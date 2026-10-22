@@ -65,8 +65,8 @@ schwab-cli get-transactions <account-hash> --types TRADE,DIVIDEND_OR_INTEREST
 schwab-cli stream --equities AAPL,MSFT   # JSON lines until Ctrl-C
 ```
 
-Global flags: `--api-key`, `--app-secret`, `--token-path`, `--timeout`.
-Every command has `--help`.
+Global flags: `--api-key`, `--app-secret`, `--token-path`, `--timeout`,
+`--rate-limit`. Every command has `--help`.
 
 ### Order safety: dry-run by default
 
@@ -81,6 +81,41 @@ schwab-cli place-order <account-hash> --file order.json          # dry-run
 schwab-cli place-order <account-hash> --file order.json --execute
 schwab-cli preview-order <account-hash> --file order.json         # API-side preview
 ```
+
+## Rate limiting
+
+Schwab's Trader API allows **120 requests per minute** per app. schwab-cli
+enforces that budget client-side so scripts and batch loops cannot outrun
+it:
+
+- **Smooth pacing.** Every REST call — all subcommands share one client —
+  passes through a single token-bucket limiter
+  ([`golang.org/x/time/rate`](https://pkg.go.dev/golang.org/x/time/rate))
+  with a burst of 1. At the default 120/minute that spaces requests one
+  every ~500 ms, so no rolling 60-second window can ever contain more
+  than 120 requests. (The burst is deliberately *not* configurable: a
+  larger burst front-loads requests and can violate a strict per-minute
+  window even at the same average rate.)
+- **Token calls are paced too.** The OAuth endpoints are separate from
+  the REST client, but the CLI routes `auth login` exchanges and
+  automatic token refreshes through the same shared limiter, so the
+  budget covers every HTTP request the tool makes.
+- **Tuning.** `--rate-limit <requests-per-minute>` or the
+  `SCHWAB_RATE_LIMIT` environment variable (the flag wins over the
+  environment). Values ≤ 0 — or a non-numeric environment value — fail
+  fast with a clear error before any command runs. Raising the limit
+  above 120 only makes sense if your app's tier allows it; Schwab will
+  still throttle you otherwise.
+- **HTTP 429 policy.** If the API throttles a call anyway, the client
+  retries up to 3 times. Each retry passes through the limiter again,
+  and waits for the server's `Retry-After` header when one is present
+  (capped at 60 s — one full rate-limit window), or exponential backoff
+  (1 s, 2 s, 4 s, ±25% jitter) when it is not. If every attempt comes
+  back 429, the command exits with an error that names the rate limit.
+  Other error statuses are returned exactly as before, unretried.
+- **Streaming is out of scope.** The `stream` command speaks WebSocket,
+  not REST, so its messages are not paced. (Its one-time user-preferences
+  lookup *is* a REST call and goes through the limiter like any other.)
 
 ## Parity checklist (schwab-py 1.5.1 → schwab-cli)
 
