@@ -1,0 +1,17 @@
+# Binaries
+/schwab-cli
+*.exe
+
+# Token files and credentials — never commit these
+token.json
+*.token.json
+schwab-token*.json
+
+# Local tooling output
+/dist/
+coverage.out
+
+# Editor / OS noise
+.idea/
+.vscode/
+.DS_Store

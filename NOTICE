@@ -1,0 +1,11 @@
+schwab-cli is a Go port of the Python library schwab-py:
+
+    schwab-py — https://github.com/alexgolec/schwab-py
+    Copyright (c) 2023 Alex Golec and the schwab-py contributors
+    Licensed under the MIT License
+
+The API surface, enum values, OAuth token-file format, and behavioral
+semantics of this tool are derived from schwab-py (version 1.5.1). The Go
+implementation in this repository is an independent re-implementation written
+for this project; it is not affiliated with or endorsed by Charles Schwab &
+Co., Inc. or by the schwab-py project.
